@@ -1,12 +1,14 @@
 ---
 - name: Get deb architecture
-  ansible.builtin.shell: dpkg --print-architecture
+  ansible.builtin.command: dpkg --print-architecture
   register: deb_architecture
+  changed_when: false
 
 - name: Get current user
-  command: whoami
+  ansible.builtin.command: whoami
   become: false
   register: current_user
+  changed_when: false
 
 - name: Install packages dependencies
   ansible.builtin.apt:
@@ -15,7 +17,7 @@
       - gnupg
       - curl
     state: present
-    update_cache: yes
+    update_cache: true
 
 ##### tor setup #####
 
@@ -24,13 +26,13 @@
     url: https://deb.torproject.org/torproject.org/A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89.asc
     state: present
     keyring: /usr/share/keyrings/tor-archive-keyring.gpg
-  when: enable_tor == true
+  when: enable_tor
 
 - name: Add tor apt repo
   ansible.builtin.apt_repository:
     repo: "deb [arch={{ deb_architecture.stdout }} signed-by=/usr/share/keyrings/tor-archive-keyring.gpg] https://deb.torproject.org/torproject.org {{ ansible_distribution_release }} main"
     state: present
-  when: enable_tor == true
+  when: enable_tor
 
 - name: Install tor packages
   ansible.builtin.apt:
@@ -38,36 +40,36 @@
       - tor
       - deb.torproject.org-keyring
     state: present
-    update_cache: yes
-  when: enable_tor == true
+    update_cache: true
+  when: enable_tor
 
 - name: Configure tor ControlPort
   ansible.builtin.lineinfile:
     path: /etc/tor/torrc
     line: ControlPort 9051
     state: present
-  when: enable_tor == true
+  when: enable_tor
 
 - name: Configure tor CookieAuthentication
   ansible.builtin.lineinfile:
     path: /etc/tor/torrc
     line: CookieAuthentication 1
     state: present
-  when: enable_tor == true
+  when: enable_tor
 
 - name: Configure tor CookieAuthFileGroupReadable
   ansible.builtin.lineinfile:
     path: /etc/tor/torrc
     line: CookieAuthFileGroupReadable 1
     state: present
-  when: enable_tor == true
+  when: enable_tor
 
 - name: Reload tor service
   ansible.builtin.service:
     name: tor
     state: restarted
     enabled: true
-  when: enable_tor == true
+  when: enable_tor
 
 ##### bitcoin core setup #####
 
@@ -75,6 +77,8 @@
   ansible.builtin.get_url:
     url: "{{ item.value }}"
     dest: /tmp
+    mode: '600'
+
   loop: "{{ lookup('ansible.builtin.dict', download_url) }}"
   when: deb_architecture.stdout in item.key
 
@@ -82,24 +86,28 @@
   ansible.builtin.get_url:
     url: "https://bitcoincore.org/bin/bitcoin-core-{{ version }}/SHA256SUMS"
     dest: /tmp
+    mode: '600'
 
 - name: Verify bitcoin core checksum
-  ansible.builtin.shell: sha256sum --ignore-missing --check SHA256SUMS
+  ansible.builtin.command: sha256sum --ignore-missing --check SHA256SUMS
   args:
     chdir: /tmp
+  changed_when: false
 
 - name: Download bitcoin core signatures
   ansible.builtin.get_url:
     url: "https://bitcoincore.org/bin/bitcoin-core-{{ version }}/SHA256SUMS.asc"
     dest: /tmp
+    mode: '600'
 
 - name: Import bitcoin core public keys
   ansible.builtin.shell: curl -s "https://api.github.com/repositories/355107265/contents/builder-keys" | grep download_url | grep -oE "https://[a-zA-Z0-9./-]+" | while read url; do curl -s "$url" | gpg --import; done
 
 - name: Verify bitcoin core signatures
-  ansible.builtin.shell: gpg --verify SHA256SUMS.asc
+  ansible.builtin.command: gpg --verify SHA256SUMS.asc
   args:
     chdir: /tmp
+  changed_when: false
 
 - name: Install bitcoin core binaries
   ansible.builtin.shell: |
@@ -125,25 +133,27 @@
   ansible.builtin.user:
     name: "{{ current_user.stdout }}"
     groups: "{{ bitcoin_group }}"
-    append: yes
-  
+    append: true
+
 - name: Add bitcoin core user to group debian-tor
   ansible.builtin.user:
     name: "{{ bitcoin_user }}"
     groups: debian-tor
-    append: yes
-  when: enable_tor == true
+    append: true
+  when: enable_tor
 
 - name: Download bitcoin core rpcauth.py script
   ansible.builtin.get_url:
     url: "https://raw.githubusercontent.com/bitcoin/bitcoin/master/share/rpcauth/rpcauth.py"
     dest: /tmp
+    mode: '600'
 
 - name: Create bitcoin core rpcauth credentials
   ansible.builtin.shell: python3 rpcauth.py {{ rpc_user }} {{ rpc_password }}
   args:
     chdir: /tmp
   register: rpcauth
+  changed_when: false
 
 - name: Create bitcoin core data dir
   ansible.builtin.file:
@@ -158,12 +168,13 @@
     dest: /home/bitcoin/.bitcoin/bitcoin.conf
     owner: "{{ bitcoin_user }}"
     group: "{{ bitcoin_user }}"
-    mode: 0640
+    mode: '640'
 
 - name: Write bitcoin core systemd service
   ansible.builtin.copy:
     src: files/bitcoind.service
     dest: /etc/systemd/system/bitcoind.service
+    mode: '644'
 
 - name: Start bitcoin core service
   ansible.builtin.service:
@@ -173,11 +184,24 @@
 
 ##### cleanup #####
 
-- name: Cleanup bitcoin core files
-  ansible.builtin.shell: |
-    rm SHA256SUMS
-    rm SHA256SUMS.asc
-    rm rpcauth.py
-    rm -rf bitcoin-{{ version }}*
-  args:
-    chdir: /tmp
+- name: Delete single files
+  ansible.builtin.file:
+    path: "/tmp/{{ item }}"
+    state: absent
+  with_items:
+    - 'SHA256SUMS'
+    - 'SHA256SUMS.asc'
+    - 'rpcauth.py'
+
+- name: Find bitcoin temp files
+  ansible.builtin.find:
+    paths: "/tmp"
+    patterns: "bitcoin-{{ version }}*"
+    file_type: any
+  register: bitcoin_dir
+
+- name: Delete bitcoin temp files
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  with_items: "{{ bitcoin_dir.files }}"
